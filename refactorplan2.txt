@@ -1,0 +1,109 @@
+Refactoring Plan Overview
+
+Goal: modular, data-driven terrain engine with pluggable noise, modifiers, combiners, warp stages, erosion, feature stamps, biome graph, distributions, and optional node-graph runtime.
+Approach: introduce cohesive abstractions (Noise/Modifiers/Combiners/Warp/Erosion/Stamps/Biomes/Distributions/Nodes), migrate existing layers to use shared APIs, and make everything profile-driven.
+Milestones
+
+M1 Core: noise registry + SampleNoise adapter.
+M2 Modifiers + data-driven layers.
+M3 Combiners/selectors + mask flow.
+M4 Advanced domain warping stages.
+M5 Erosion pipeline (toggleable per world).
+M6 Feature stamps + placement.
+M7 Biome graph classifier.
+M8 Distributions.
+M9 Node-graph runtime + op set.
+M10 Cleanup, docs, examples, perf passes.
+Core Abstractions
+
+NOISE_REGISTRY: Dict[str, Callable] with unified 2D signature.
+SampleNoise(profile, x, y, perm, override_freq=None) -> float route all sampling through registry.
+ApplyModifiers(value, mods) -> float chain typed modifiers.
+Combine(a, b, mode, mask=None) -> float standard compositing ops.
+ApplyWarp(nx, ny, stages, perm) -> (nx, ny) staged warping.
+Layer interface: deps, compute(world, params, perm).
+Profiles (JSON/YAML) for noise, modifiers, warps, erosion, distributions, biome grid, node graph.
+M1: Noise Registry + Sampling
+
+Add families: billow, cellular/Worley, hybrid/Musgrave, “FBM-over-Worley”.
+Normalize outputs to [-1,1] (document and enforce).
+Implement NOISE_REGISTRY = { "perlin": Perlin2D, "fbm": fBm, "ridged": RidgedMF, "billow": BillowMF, "cellular": Worley2D, "hybrid": HybridMF, "fbm_over_cell": FBMOverWorley }.
+Replace direct fBm calls in layers with SampleNoise(p.noise_profiles["..."], x, y, perm).
+M2: Modifiers
+
+Implement operators: abs, pow(k), terrace(steps), clamp(lo,hi), smoothmin(a,b,k) (utility), remap(in0,in1,out0,out1), add_noise(small_noise, amount).
+ApplyModifiers(value, mods) applies in order, modifiers defined per layer profile.
+Update example layer to be data-driven:
+noise: "fbm", freq: 0.04, modifiers: [{type:"abs"}, {type:"pow", k:0.7}, {type:"remap", in0:-1, in1:1, out0:-0.8, out1:1.1}].
+M3: Combiners/Selectors
+
+Implement Combine(a,b,mode,mask) with modes: add, mul, max, min, lerp.
+Add CombineHeight layer: input_a, input_b, mask, mode.
+Provide threshold-select helper to emulate World Machine selector via mask + step/smoothstep.
+M4: Advanced Domain Warping
+
+Add warp_stages: [{noise,freq,strength}, ...] to layer/world params.
+ApplyWarp loops stages sampling dvx/dvy from the chosen noise, then updates coords.
+Allow warps per-layer and/or global pre-warp for coordinates.
+M5: Erosion Pipeline
+
+Add erosion profile: enabled, type (thermal_then_hydro), iterations, talus, rain, etc.
+Implement Erosion layer with deps and iterative ThermalRelax + HydraulicStep.
+Keep as optional post-process step; honor enabled.
+M6: Feature Stamps / Splats
+
+Define feature_params: list of stamp specs (type, count, constraints, radius, strength, seed).
+Implement Stamps layer: chooses locations by mask/constraints and calls StampShape.
+Implement StampShape(heightfield, cx, cy, feat) with parametric shapes (cone, volcano rim, crater bowl, SDF-based).
+M7: Biome Graphs
+
+Add BiomeClassify layer: depends on temperature, moisture, normalized height.
+Implement 2D lookup table biome_grid.table[ti][mi] with bucket counts and min/max ranges.
+Tag tiles with biome; expose masks derived from biome tags for later layers.
+M8: Distributions
+
+Add ApplyDistribution(val, dist) with pow(k) and sigmoid(mid, steep) (extensible).
+Allow profiles per field: e.g., land_height, forest_density; apply after raw field calc and before combining.
+M9: Node-Graph Runtime (Optional Endgame)
+
+nodes: Dict[str, NodeSpec] with ops: noise, warp, blend/lerp, combine(add/mul/max/min), mask/threshold, modifier_chain, erosion, stamp, cache.
+eval_node(name) evaluates with memoization; each op implemented using the abstractions above.
+Start with subset of ops; expand as needed.
+Config Schema (examples)
+
+Noise profile:
+noise_profiles.mountains = { "noise": "ridged", "octaves": 5, "freq": 3.0, "gain": 0.5, "lacunarity": 2.0, "warp_stages": [ {"noise":"fbm","freq":1.5,"strength":0.25}, {"noise":"ridged","freq":4.0,"strength":0.1} ] }
+Combine layer:
+CombineHeight: { input_a: "base_height", input_b: "mountain_noise", mask: "continent_mask", mode: "lerp" }
+Erosion:
+erosion_profile = { "enabled": true, "type": "thermal_then_hydro", "iterations": 30, "talus": 0.6, "rain": 0.2 }
+Biome grid:
+biome_grid = { "temp_count": 6, "moist_count": 6, "table": [[...],[...],...] }
+Migration Strategy
+
+Add registry + adapters without breaking old calls; deprecate direct noise use behind a feature flag.
+Wrap existing layers with modifiers and combine support; keep default empty modifiers for parity.
+Gradually move “hand-coded” blends to CombineHeight; keep legacy paths until parity verified.
+Gate erosion/stamps/graph by config enabled flags.
+Testing & Validation
+
+Determinism tests: fixed seed → identical fields after refactor.
+Range tests: verify normalized outputs in [-1,1] pre/post modifiers; assert clamping.
+Property tests: abs >= 0, pow monotonicity, terrace band count, smoothmin continuity.
+Visual snapshot tests: image hashes for key fields at small resolution.
+Performance baselines: time per field size for common profiles; set budgets/regress guards.
+Performance Considerations
+
+Cache per-node/field results (memoize eval_node).
+Reuse noise permutations; avoid re-allocations in inner loops.
+Vectorize where you already use arrays; batch sample noise for tiles.
+Keep warp_stages small and profile; consider downsample/upsample for expensive ops.
+Assumptions / Notes
+
+Coordinate system normalizes to world scale and feeds noise in consistent units.
+All sampling returns floats in [-1,1] unless explicitly remapped.
+perm or RNG is already plumbed; pass it through all new APIs.
+Next Steps
+
+Confirm current hotspots in 2main.py and how layers are represented.
+I can draft the scaffolding for NOISE_REGISTRY, SampleNoise, ApplyModifiers, Combine, and ApplyWarp plus minimal config parsing. Would you like me to proceed?

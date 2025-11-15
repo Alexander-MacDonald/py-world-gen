@@ -1,0 +1,252 @@
+1. More noise families (what others use)
+
+You have: Perlin, fBm, ridged, domain warp
+You can add:
+
+Billow noise (soft rounded hills)
+    Billow(x,y):
+    n = Perlin2D(x,y)
+    return 2*abs(n) - 1    // 0..1 → -1..1 of “puffed” noise
+Worley / Cellular (a.k.a. Voronoi noise)
+Used for plate IDs, cracked terrain, badlands, deserts.
+    Cellular(x,y):
+    cell = find_nearest_feature(x,y)
+    return distance_to(cell)
+Hybrid multifractal / Musgrave-style (Terragen-ish)
+These give you those “real mountain” looks.
+    HybridMF(x,y):
+    value = base
+    weight = value
+    for i in octaves:
+        signal = Perlin2D(x*freq, y*freq)
+        signal = (signal + offset) * gain
+        value += weight * signal
+        weight = clamp(signal, 0, 1)
+FBM over Worley (common in terrain tools):
+    n = fBm(x,y,..)
+    c = Worley(x,y,..)
+    height = n - 0.5 * c
+Noise from SDFs: combine distances to shapes
+→ great for islands, atolls, crater chains.
+NOISE_REGISTRY = {
+  "perlin": Perlin2D,
+  "fbm": fBm,
+  "ridged": RidgedMF,
+  "billow": BillowMF,
+  "cellular": Worley2D,
+  "hybrid": HybridMF,
+}
+
+Then layers don’t call fBm directly — they call:
+noise = SampleNoise(p.noise_profiles["mountains"], x, y, perm)
+
+2. Modifiers (everyone uses these)
+
+Games/tools like Terragen, World Machine, Gaea all do the same thing: noise → chain of modifiers.
+
+Add these operators:
+
+Abs(n) – good for ridges & mirrored features
+
+Pow(n, k) – shape noise, make peaks sharper: n^0.5, n^2
+
+Terrace(n, steps) – Minecraft-like banding
+
+Clamp(n, lo, hi) – for masks
+
+SmoothMin(a,b,k) – blend two shapes without hard seam
+
+Remap(n, inMin,inMax, outMin,outMax) – your engine already needs this
+
+AddNoise(n, small_noise, amount) – microdetail pass
+
+FUNCTION ApplyModifiers(value, mods):
+    for m in mods:
+        if m.type == "abs":      value = abs(value)
+        if m.type == "pow":      value = sign(value) * abs(value) ** m.k
+        if m.type == "terrace":  value = Terrace(value, m.steps)
+        if m.type == "remap":    value = Remap(value, m.in0, m.in1, m.out0, m.out1)
+    return value
+Then your layer can be 100% data-driven:
+    layer "BaseHeight":
+  noise: "fbm"
+  freq: 0.04
+  modifiers:
+    - { type: "abs" }
+    - { type: "pow", k: 0.7 }
+    - { type: "remap", in0:-1, in1:1, out0:-0.8, out1:1.1 }
+
+    3. Combiners / selectors (the big boys use this a lot)
+
+“Other” gens rarely do just height = noise. They do:
+
+Blend by mask:
+height = lerp(lowlands, mountains, mountain_mask)
+Select by threshold: (World Machine style)
+if mask < 0.4: use A
+else: use B
+Max/Min composition: for dunes, ridges, cliffs
+height = max(base, dunes * dunes_mask)
+Pseudocode combiner:
+FUNCTION Combine(a, b, mode, mask=None):
+    if mode == "add": return a + b
+    if mode == "mul": return a * b
+    if mode == "max": return max(a, b)
+    if mode == "min": return min(a, b)
+    if mode == "lerp": return a*(1-mask) + b*mask
+
+Make a layer type:
+LAYER CombineHeight:
+    input_a: "base_height"
+    input_b: "mountain_noise"
+    mask:    "continent_mask"
+    mode:    "lerp"
+
+4. Advanced domain warping (like No Man’s Sky-ish stuff)
+
+You already do 1-level warp:
+(wx, wy) = DomainWarp(nx, ny, freq, strength)
+
+warpA = fBm(nx, ny, freqA, ...)
+warpB = fBm(nx+100, ny-100, freqB, ...)
+nx2 = nx + warpA * strengthA
+ny2 = ny + warpB * strengthB
+
+# optional 2nd stage warp
+warpC = RidgedMF(nx2, ny2, freqC,...)
+nx3 = nx2 + warpC * strengthC
+ny3 = ny2
+So: add a list of warps to params:
+warp_stages = [
+  { "freq": 1.5, "strength": 0.25, "noise": "fbm" },
+  { "freq": 4.0, "strength": 0.1,  "noise": "ridged" },
+]
+
+FUNCTION ApplyWarp(nx, ny, warp_stages, perm):
+    for w in warp_stages:
+        dvx = SampleNoise(w.noise, nx, ny, perm, w.freq)
+        dvy = SampleNoise(w.noise, nx+100, ny-100, perm, w.freq)
+        nx += dvx * w.strength
+        ny += dvy * w.strength
+    return nx, ny
+    Now you can get organic coastlines, tearing, streaking — the “advanced” look.
+
+    5. Erosion-like postprocessing (the fancy look)
+
+Lots of noise gens look fake until you add erosion or flow. You already have hydraulic/thermal placeholders. Make them options per world:
+erosion_profile = {
+  "enabled": true,
+  "type": "thermal_then_hydro",
+  "iterations": 30,
+  "talus": 0.6,
+  "rain": 0.2
+}
+Pseudocode layer:
+LAYER Erosion:
+    deps=["FlowAndRivers"]
+    compute(world, p, perm):
+        if not p.erosion_profile.enabled: return
+        for i in 1..p.erosion_profile.iterations:
+            ThermalRelax(world.fields["height"], p.erosion_profile.talus)
+            HydraulicStep(...)
+Other gens (Valheim, modded Minecraft terrain mods) effectively “smear” slopes to look taller/real — this is how.
+6. Feature stamps / splats (very common)
+
+Noise by itself can’t do “one volcano here”. Tools do this:
+
+choose a location (by mask or random)
+
+blend in a stamp (heightmap shape) at that point
+feature_params = [
+  { "type": "volcano", "count": 4, "min_height": 0.4, "radius": 14 },
+  { "type": "crater",  "count": 20, "on": "desert" },
+]
+LAYER Stamps:
+    deps=["BiomeClassify"]
+    compute(world, p, perm):
+        for feat in p.feature_params:
+            for i in 1..feat.count:
+                (x,y) = pick_tile_matching(world, feat)
+                StampShape(world.fields["height"], x, y, feat)
+                FUNCTION StampShape(heightfield, cx, cy, feat):
+    for (x,y) in circle around (cx,cy) radius=feat.radius:
+        d = distance((x,y),(cx,cy))/feat.radius  # 0..1
+        shape = 1 - d*d
+        heightfield[x][y] += shape * 0.25
+        That’s how you mix handcrafted with noisy.
+    7. Biome graphs (what games actually do)
+Many games don’t “if temp > 20 → savannah”. They do 2D lookup: temperature × moisture (sometimes × height).
+
+So you can do:
+biome_matrix[ temp_bucket ][ moisture_bucket ] = "tropical_forest"
+LAYER BiomeClassify:
+    deps=["Temperature","MoistureLike","NormalizeHeight"]
+    compute(world, p, perm):
+        for each tile:
+            T = clamp01( (tile.temp - T_min)/(T_max - T_min) )
+            M = clamp01( ... moisture ... )
+            t_idx = int(T * (p.biome_grid.temp_count - 1))
+            m_idx = int(M * (p.biome_grid.moist_count - 1))
+            biome = p.biome_grid.table[t_idx][m_idx]
+            tile.tags.add(biome)
+    Now adding new biomes is literally “edit the 2D table”.
+8. Different distributions (not just uniform)
+
+Sometimes you want a field to follow a curve, not uniform noise. E.g. “most land is low, some high”. You can add a generic distribution operator:
+distribution_profiles = {
+  "land_height": { "type": "pow", "k": 1.4 },
+  "forest_density": { "type": "sigmoid", "mid": 0.5, "steep": 6 },
+}
+FUNCTION ApplyDistribution(val, dist):
+    if dist.type == "pow":
+        return val ** dist.k
+    if dist.type == "sigmoid":
+        return 1 / (1 + exp(-dist.steep*(val - dist.mid)))
+    return val
+
+tile.props["tree_cover"] = ApplyDistribution(raw_tree, p.distribution_profiles["forest_density"])
+9. Node-graph style engine (the real endgame)
+
+Most commercial terrain tools are literally “nodes”. You can emulate a light version:
+nodes = {
+  "continent": {
+    "op": "noise",
+    "noise": "fbm",
+    "freq": 0.4,
+  },
+  "mountains": {
+    "op": "noise",
+    "noise": "ridged",
+    "freq": 3.0,
+  },
+  "continent_warped": {
+    "op": "warp",
+    "source": "continent",
+    "warp_source": "mountains",
+    "strength": 0.25,
+  },
+  "final_height": {
+    "op": "blend",
+    "a": "continent_warped",
+    "b": "mountains",
+    "mask": "continent_warped",
+  }
+}
+Runtime pseudocode:
+FUNCTION eval_node(name):
+    if name in cache: return cache[name]
+    node = nodes[name]
+    if node.op == "noise":
+        field = make_noise_field(node.noise, node.freq, ...)
+    elif node.op == "warp":
+        src  = eval_node(node.source)
+        warp = eval_node(node.warp_source)
+        field = apply_warp(src, warp, node.strength)
+    elif node.op == "blend":
+        A = eval_node(node.a)
+        B = eval_node(node.b)
+        M = eval_node(node.mask)
+        field = A*(1-M) + B*M
+    cache[name] = field
+    return field
+Now “include advanced features” is literally “add a new node op”.
